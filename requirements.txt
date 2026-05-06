@@ -1,0 +1,7 @@
+flask
+flask-cors
+Pillow
+torch
+torchvision
+ultralytics
+requests
