@@ -5,12 +5,13 @@ import torch
 from torchvision import transforms, models
 from ultralytics import YOLO
 import io
-import requests
 import os
 import time
 import uuid
-import json
 from werkzeug.utils import secure_filename
+
+# Rule-based insights engine (replaces Ollama/LLaMA)
+from faw_rules import get_rule_based_insights
 
 app = Flask(__name__)
 CORS(app)
@@ -67,10 +68,10 @@ yolo_model = YOLO(YOLO_PATH)
 FAW_CLASSES = ["egg", "larva", "pupa", "moth"]
 
 LIFE_STAGE_RISK = {
-    "egg": "Low",
+    "egg":   "Moderate",
     "larva": "High",
-    "pupa": "Low",
-    "moth": "High"
+    "pupa":  "Low–Moderate",
+    "moth":  "Moderate–High",
 }
 
 # -----------------------------
@@ -82,35 +83,33 @@ def annotate_image(image, detections):
     img_w, img_h = image.size
 
     COLORS = {
-        "egg": (255, 215, 0),
+        "egg":   (255, 215, 0),
         "larva": (255, 0, 0),
-        "pupa": (255, 140, 0),
-        "moth": (0, 120, 255)
+        "pupa":  (255, 140, 0),
+        "moth":  (0, 120, 255),
     }
 
     try:
         font = ImageFont.truetype("arial.ttf", 18)
-    except:
+    except Exception:
         font = ImageFont.load_default()
 
     for det in detections:
-
         stage = det["class"]
-        conf = det.get("confidence", 0)
+        conf  = det.get("confidence", 0)
 
         x1 = int(det["x"] * img_w)
         y1 = int(det["y"] * img_h)
-        x2 = int((det["x"] + det["width"]) * img_w)
+        x2 = int((det["x"] + det["width"])  * img_w)
         y2 = int((det["y"] + det["height"]) * img_h)
 
         color = COLORS.get(stage, (255, 255, 255))
 
-        # Draw box
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
 
-        label = f"{stage.upper()} {conf*100:.1f}%"
+        label = f"{stage.upper()} {conf * 100:.1f}%"
 
-        bbox = draw.textbbox((0, 0), label, font=font)
+        bbox   = draw.textbbox((0, 0), label, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
 
@@ -120,88 +119,17 @@ def annotate_image(image, detections):
 
         draw.rectangle(
             [x1, label_y, x1 + text_w + 6, label_y + text_h + 4],
-            fill=(*color, 180)
+            fill=(*color, 180),
         )
-
         draw.text(
             (x1 + 3, label_y + 2),
             label,
             fill=(0, 0, 0),
-            font=font
+            font=font,
         )
 
     return image
 
-# -----------------------------
-# OLLAMA (LLAMA 3.2)
-# -----------------------------
-def ask_llm(text_data):
-
-    try:
-        url = "http://localhost:11434/api/chat"
-
-        payload = {
-            "model": "llama3.2:1b",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"""
-You are an agricultural pest expert specializing in Fall Army Worm (FAW).
-
-Based on detection results:
-
-{text_data}
-
-Return STRICT JSON format:
-
-{{
-  "analysis": "Explain why this is the detected life stage (visual traits) and why risk level is assigned",
-  "treatment": "Give mitigation plan: immediate action, control methods, prevention"
-}}
-"""
-                }
-            ],
-            "stream": False,
-            "options": {
-                "num_ctx": 1024
-            }
-        }
-
-        print("\n📥 INPUT TO LLM:")
-        print(text_data)
-
-        response = requests.post(url, json=payload, timeout=60)
-
-        if response.status_code == 200:
-            result = response.json()["message"]["content"]
-
-            print("\n🧠 OLLAMA OUTPUT:")
-            print(result)
-            print("=" * 60)
-
-            # Try parsing JSON
-            try:
-                parsed = json.loads(result)
-            except:
-                parsed = {
-                    "analysis": result,
-                    "treatment": "Parsing failed"
-                }
-
-            return parsed
-
-        print("❌ Ollama Error:", response.text)
-        return {
-            "analysis": "LLM error",
-            "treatment": "LLM error"
-        }
-
-    except Exception as e:
-        print("❌ Ollama Exception:", str(e))
-        return {
-            "analysis": "LLM failed",
-            "treatment": "LLM failed"
-        }
 
 # -----------------------------
 # ROUTES
@@ -210,9 +138,11 @@ Return STRICT JSON format:
 def home():
     return "<h1>FAW Server Running</h1>"
 
+
 @app.route("/uploads/<filename>")
 def get_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
 
 # -----------------------------
 # MAIN PIPELINE
@@ -223,12 +153,12 @@ def predict():
     if "image" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
-    file = request.files["image"]
+    file      = request.files["image"]
     img_bytes = file.read()
 
-    filename = secure_filename(file.filename)
+    filename    = secure_filename(file.filename)
     unique_name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{filename}"
-    save_path = os.path.join(UPLOAD_FOLDER, unique_name)
+    save_path   = os.path.join(UPLOAD_FOLDER, unique_name)
 
     with open(save_path, "wb") as f:
         f.write(img_bytes)
@@ -236,7 +166,7 @@ def predict():
     try:
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        # MobileNet
+        # ── MobileNet binary classifier ──────────────────────────
         tensor = mobilenet_transform(image).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
@@ -245,89 +175,87 @@ def predict():
 
         prediction = CLASS_NAMES[pred.item()]
 
-        # -------------------------
-        # FAW → YOLO
-        # -------------------------
+        # ── FAW detected → YOLO stage detection ──────────────────
         if prediction == "FAW":
 
             results = yolo_model(image)
 
             detected = []
-            boxes = []
-
-            w, h = image.size
+            boxes    = []
+            w, h     = image.size
 
             for r in results:
                 for box in r.boxes:
-
-                    cls = FAW_CLASSES[int(box.cls[0])]
+                    cls  = FAW_CLASSES[int(box.cls[0])]
                     conf = float(box.conf[0])
 
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
 
                     boxes.append({
-                        "class": cls,
-                        "x": x1 / w,
-                        "y": y1 / h,
-                        "width": (x2 - x1) / w,
-                        "height": (y2 - y1) / h,
-                        "confidence": conf
+                        "class":      cls,
+                        "x":          x1 / w,
+                        "y":          y1 / h,
+                        "width":      (x2 - x1) / w,
+                        "height":     (y2 - y1) / h,
+                        "confidence": conf,
                     })
-
                     detected.append(cls)
 
-            annotated = annotate_image(image.copy(), boxes)
-
-            out_name = "annotated_" + unique_name
+            # Annotate and save image
+            annotated  = annotate_image(image.copy(), boxes)
+            out_name   = "annotated_" + unique_name
             annotated.save(os.path.join(UPLOAD_FOLDER, out_name))
 
-            risk = "High" if any(LIFE_STAGE_RISK[d] == "High" for d in detected) else "Low"
+            # Overall risk: High if any high-risk stage is present
+            risk = (
+                "High"
+                if any(LIFE_STAGE_RISK.get(d, "Low") in ("High", "Moderate–High")
+                       for d in detected)
+                else "Low–Moderate"
+            )
 
-            # LLM INPUT
-            llm_input = f"""
-Prediction: FAW
-Detected stages: {detected}
-Risk level: {risk}
-Number of detections: {len(detected)}
-"""
-
-            explanation = ask_llm(llm_input)
+            # ── Rule-based insights (replaces Ollama) ────────────
+            insights = get_rule_based_insights(detected, risk)
 
             return jsonify({
-                "pest": "Fall Army Worm",
-                "stages": detected,
-                "risk": risk,
-                "boxes": boxes,
-                "analysis": explanation["analysis"],
-                "treatment": explanation["treatment"],
-                "image_url": f"http://{request.host}/uploads/{out_name}"
+                "pest":       "Fall Army Worm",
+                "stages":     detected,
+                "risk":       risk,
+                "boxes":      boxes,
+                "analysis":   insights["analysis"],
+                "treatment":  insights["treatment"],
+                "image_url":  f"http://{request.host}/uploads/{out_name}",
             })
 
-        # -------------------------
-        # NOT FAW → LLM
-        # -------------------------
+        # ── NOT FAW ──────────────────────────────────────────────
         else:
-
-            llm_input = f"""
-Prediction: Not FAW
-Model output: {prediction}
-"""
-
-            explanation = ask_llm(llm_input)
-
             return jsonify({
-                "pest": "Unknown",
-                "analysis": explanation["analysis"],
-                "treatment": explanation["treatment"],
-                "image_url": f"http://{request.host}/uploads/{unique_name}"
+                "pest":      "Unknown / Not FAW",
+                "analysis":  (
+                    "The image does not appear to contain Fall Armyworm (FAW). "
+                    "The MobileNetV3 classifier did not detect FAW characteristics. "
+                    "If you believe this is incorrect, try a clearer, closer image "
+                    "of the pest or affected plant part."
+                ),
+                "treatment": (
+                    "No FAW-specific treatment is required at this time. Continue "
+                    "regular field scouting using the BPI W-pattern method "
+                    "(5 inspection points per field, minimum 10 plants per stop). "
+                    "Maintain pheromone traps at 4–5 traps per hectare and replace "
+                    "lures every 6 weeks. If FAW is suspected based on crop damage "
+                    "symptoms (window-pane feeding, whorl damage, inverted-Y markings "
+                    "on larvae), consult your Regional Crop Protection Center (RCPC)."
+                ),
+                "image_url": f"http://{request.host}/uploads/{unique_name}",
             })
 
     except Exception as e:
         print("❌ SERVER ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
 
+
 # -----------------------------
-# RUN - NGROK COMPATIBLE (PORT 8000)
+# RUN — NGROK COMPATIBLE (PORT 8000)
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True, threaded=True)
